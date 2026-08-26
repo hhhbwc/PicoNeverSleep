@@ -20,6 +20,7 @@
 ## ⛏️ Prerequisites
 * **Device:** Pico 4 Headset (Phoenix/China firmware supported).
 * **Permissions:** **[Root Access](https://pico4.wiki/guides/root/01-root/)** is required to apply changes to system files.
+   * Recommend using [picounlock](https://github.com/chaixshot/more-picohaxx)
 * **Environment:** **[LSPosed Framework](https://github.com/JingMatrix/Vector/releases/tag/v2.0)** must be installed and active.
 * **Scope:** Both **System Framework (android)** and **PicoVR Settings (com.picovr.settings)** must be selected in LSPosed Manager.
 
