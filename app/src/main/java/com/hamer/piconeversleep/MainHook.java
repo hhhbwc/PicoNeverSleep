@@ -11,6 +11,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
+import java.lang.reflect.Constructor;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -25,12 +26,15 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public final class MainHook implements IXposedHookLoadPackage {
     private static final String TAG = "PicoNeverSleep";
     private static final String SETTINGS_PACKAGE = "com.picovr.settings";
-    private static final int NEVER_SLEEP_TILE = 9001;
+    private static final int NEVER_SLEEP_TILE = 9002;
+    private static final String TILE_ADDED_KEY = "pico_neversleep_quick_added";
+    private static final String TILE_INDEX_KEY = "pico_neversleep_quick_index";
     private static final String SETTING_NEVER_SLEEP = "pvr_never_sleep_enabled";
     private static final String PROP_NEVER_SLEEP_VOLATILE = "pvr.factorytest.never.sleep";
     private static final String MODULE_PACKAGE = "com.hamer.piconeversleep";
     
     private static volatile Object sButton;
+    private static final ThreadLocal<Object> MAPPED_BIND_ITEM = new ThreadLocal<>();
 
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lp) {
@@ -52,8 +56,9 @@ public final class MainHook implements IXposedHookLoadPackage {
                 protected void afterHookedMethod(MethodHookParam p) {
                     try {
                         List<?> data = (List<?>) XposedHelpers.getObjectField(p.thisObject, "a");
-                        Object info = data.get((Integer) p.args[0]);
-                        if ((Integer) XposedHelpers.callMethod(info, "f") == NEVER_SLEEP_TILE) {
+                        int position = (Integer) p.args[0];
+                        if (position >= 0 && position < data.size()
+                                && buttonType(data.get(position)) == NEVER_SLEEP_TILE) {
                             p.setResult(1);
                         }
                     } catch (Throwable t) {
@@ -67,19 +72,34 @@ public final class MainHook implements IXposedHookLoadPackage {
                 "androidx.recyclerview.widget.RecyclerView$ViewHolder", int.class, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam p) {
+                    MAPPED_BIND_ITEM.remove();
                     try {
                         List<?> data = (List<?>) XposedHelpers.getObjectField(p.thisObject, "a");
-                        Object info = data.get((Integer) p.args[1]);
-                        if ((Integer) XposedHelpers.callMethod(info, "f") == NEVER_SLEEP_TILE) {
-                            // Map to internal type 1 for proper layout selection
-                            XposedHelpers.callMethod(info, "m", 1);
+                        int position = (Integer) p.args[1];
+                        if (position >= 0 && position < data.size()) {
+                            Object item = data.get(position);
+                            if (buttonType(item) == NEVER_SLEEP_TILE) {
+                                MAPPED_BIND_ITEM.set(item);
+                                XposedHelpers.callMethod(item, "m", 1);
+                            }
                         }
-                    } catch (Throwable t) {}
+                    } catch (Throwable t) {
+                        MAPPED_BIND_ITEM.remove();
+                    }
                 }
 
                 @Override
                 protected void afterHookedMethod(MethodHookParam p) {
-                    configureButton(p.args[0], (Integer) p.args[1]);
+                    int position = (Integer) p.args[1];
+                    try {
+                        configureButton(p.thisObject, p.args[0], position);
+                    } finally {
+                        Object mapped = MAPPED_BIND_ITEM.get();
+                        MAPPED_BIND_ITEM.remove();
+                        if (mapped != null) {
+                            try { XposedHelpers.callMethod(mapped, "m", NEVER_SLEEP_TILE); } catch (Throwable ignored) {}
+                        }
+                    }
                 }
             });
 
@@ -87,7 +107,10 @@ public final class MainHook implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(adapterClass, "b", ArrayList.class, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam p) {
-                    removeDuplicates((ArrayList<?>) p.args[0]);
+                    ArrayList<?> list = (ArrayList<?>) XposedHelpers.getObjectField(p.thisObject, "a");
+                    if (list == null) list = (ArrayList<?>) p.args[0];
+                    removeDuplicates(list);
+                    repositionTile(list);
                 }
             });
 
@@ -100,11 +123,90 @@ public final class MainHook implements IXposedHookLoadPackage {
                     p.args[1] = quickPanelCallback(p.args[1], loadCallback, lp.classLoader);
                 }
             });
+            installEditorHooks(lp.classLoader);
 
             XposedBridge.log(TAG + ": Hooks installed successfully");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": Failed to install hooks: " + t);
         }
+    }
+
+    private void installEditorHooks(final ClassLoader cl) {
+        try {
+            final Class<?> fragment = XposedHelpers.findClass("com.picovr.fragments.QuickPanelFragment", cl);
+            final Class<?> manager = XposedHelpers.findClass("com.picovr.database.quickpanel.QuickPanelManager", cl);
+            final Class<?> callback = XposedHelpers.findClass("com.picovr.listener.ResultCallback", cl);
+            final Class<?> added = XposedHelpers.findClass("com.picovr.adapters.QuickPanelAddedAdapter", cl);
+            final Class<?> more = XposedHelpers.findClass("com.picovr.adapters.QuickPanelMoreAdapter", cl);
+            XposedHelpers.findAndHookMethod(manager, "A", List.class, callback, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) { p.args[0] = saveEditorTile((List<?>) p.args[0]); }
+            });
+            XposedHelpers.findAndHookMethod(fragment, "I", List.class, List.class, boolean.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) { addEditorTile((List<?>) p.args[0], (List<?>) p.args[1], cl); }
+            });
+            XC_MethodHook bind = new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) { bindEditorTile(p.thisObject, p.args[0], (Integer) p.args[1]); }
+            };
+            XposedHelpers.findAndHookMethod(added, "m", XposedHelpers.findClass("com.picovr.adapters.QuickPanelAddedAdapter$AddedHolder", cl), int.class, bind);
+            XposedHelpers.findAndHookMethod(more, "c", XposedHelpers.findClass("com.picovr.adapters.QuickPanelMoreAdapter$MoreHolder", cl), int.class, bind);
+            XposedBridge.log(TAG + ": editor hooks installed");
+        } catch (Throwable t) { XposedBridge.log(TAG + ": editor hooks unavailable " + t); }
+    }
+
+    private static Object currentApplication() throws Exception {
+        return Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null);
+    }
+    private static int panelType(Object item) { try { return ((Integer) item.getClass().getMethod("f").invoke(item)).intValue(); } catch (Throwable t) { return -1; } }
+    private static int panelIndex(Object item) { try { return ((Integer) item.getClass().getMethod("d").invoke(item)).intValue(); } catch (Throwable t) { return 0; } }
+    private static boolean panelAdded(Object item) { try { return ((Boolean) item.getClass().getMethod("g").invoke(item)).booleanValue(); } catch (Throwable t) { return false; } }
+    private static int panelName(Object item) { try { return ((Integer) item.getClass().getMethod("e").invoke(item)).intValue(); } catch (Throwable t) { return 0; } }
+    private static int panelIcon(Object item) { try { return ((Integer) item.getClass().getMethod("b").invoke(item)).intValue(); } catch (Throwable t) { return 0; } }
+    private static void addEditorTile(List<?> added, List<?> more, ClassLoader cl) {
+        try {
+            Object context = currentApplication();
+            int state = getGlobalInt((Context) context, TILE_ADDED_KEY, 1);
+            List target = state == 1 ? added : more;
+            for (Object item : added) if (panelType(item) == NEVER_SLEEP_TILE) return;
+            for (Object item : more) if (panelType(item) == NEVER_SLEEP_TILE) return;
+            Object template = !added.isEmpty() ? added.get(0) : (more.isEmpty() ? null : more.get(0));
+            if (template == null) return;
+            Class<?> itemClass = XposedHelpers.findClass("com.picovr.database.quickpanel.QuickPanelItem", cl);
+            Constructor<?> c = itemClass.getConstructor(int.class,int.class,int.class,int.class,int.class,String.class);
+            int index = clampIndex(getGlobalInt((Context) context, TILE_INDEX_KEY, target.size()), target.size());
+            target.add(index, c.newInstance(NEVER_SLEEP_TILE,index,state,panelName(template),panelIcon(template),"neversleep"));
+            XposedBridge.log(TAG + ": editor tile added state=" + state + " index=" + index + " addedSize=" + added.size() + " moreSize=" + more.size());
+        } catch (Throwable t) { XposedBridge.log(TAG + ": editor tile injection failed " + t); }
+    }
+    private static List<?> saveEditorTile(List<?> list) {
+        try {
+            Object context = currentApplication(); ArrayList copy = new ArrayList(list);
+            for (Object item : list) if (panelType(item) == NEVER_SLEEP_TILE) {
+                putGlobalInt((Context) context, TILE_ADDED_KEY, panelAdded(item) ? 1 : 0);
+                int savedIndex = list.indexOf(item);
+                putGlobalInt((Context) context, TILE_INDEX_KEY, savedIndex);
+                XposedBridge.log(TAG + ": saved editable tile state added=" + (panelAdded(item) ? 1 : 0) + " index=" + savedIndex + " itemIndex=" + panelIndex(item));
+                copy.remove(item);
+            }
+            return copy;
+        } catch (Throwable t) { return list; }
+    }
+    private static void bindEditorTile(Object adapter, Object holder, int position) {
+        try {
+            java.lang.reflect.Field data = adapter.getClass().getDeclaredField("b");
+            data.setAccessible(true);
+            List<?> list = (List<?>) data.get(adapter);
+            if (position < 0 || position >= list.size() || panelType(list.get(position)) != NEVER_SLEEP_TILE) return;
+            boolean isAdded = holder.getClass().getName().contains("Added");
+            java.lang.reflect.Field text = holder.getClass().getDeclaredField(isAdded ? "d" : "c");
+            text.setAccessible(true);
+            Object label = text.get(holder);
+            label.getClass().getMethod("setText", CharSequence.class).invoke(label, "Never Sleep");
+            java.lang.reflect.Field image = holder.getClass().getDeclaredField(isAdded ? "c" : "b");
+            image.setAccessible(true);
+            Object imageView = image.get(holder);
+            Drawable drawable = getModuleDrawable((Context) currentApplication());
+            if (drawable != null) imageView.getClass().getMethod("setImageDrawable", Drawable.class).invoke(imageView, drawable);
+        } catch (Throwable ignored) {}
     }
 
     private void hookSystemReady(XC_LoadPackage.LoadPackageParam lp) {
@@ -148,13 +250,17 @@ public final class MainHook implements IXposedHookLoadPackage {
             @Override
             public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
                 if ("a".equals(method.getName()) && args != null && args.length == 1) {
-                    ArrayList<Object> list = (ArrayList<Object>) args[0];
-                    if (!hasTile(list, NEVER_SLEEP_TILE)) {
+                            ArrayList<Object> list = (ArrayList<Object>) args[0];
+                    Context context = null;
+                    try { context = (Context) currentApplication(); } catch (Throwable ignored) {}
+                    if (context != null && getGlobalInt(context, TILE_ADDED_KEY, 1) == 1
+                            && !hasTile(list, NEVER_SLEEP_TILE)) {
                         try {
                             Class<?> infoClass = XposedHelpers.findClass("com.picovr.quicksettings.button.QuickSettingButtonInfo", cl);
                             Object item = XposedHelpers.newInstance(infoClass);
                             XposedHelpers.callMethod(item, "m", NEVER_SLEEP_TILE);
-                            list.add(0, item);
+                            int index = clampIndex(getGlobalInt(context, TILE_INDEX_KEY, 0), list.size());
+                            list.add(index, item);
                         } catch (Throwable t) {
                             XposedBridge.log(TAG + ": Tile injection failed: " + t);
                         }
@@ -178,7 +284,7 @@ public final class MainHook implements IXposedHookLoadPackage {
         boolean seen = false;
         for (int i = list.size() - 1; i >= 0; i--) {
             try {
-                if ((Integer) XposedHelpers.callMethod(list.get(i), "f") == NEVER_SLEEP_TILE) {
+                if (buttonType(list.get(i)) == NEVER_SLEEP_TILE) {
                     if (seen) list.remove(i);
                     else seen = true;
                 }
@@ -186,23 +292,63 @@ public final class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private void configureButton(Object holder, int position) {
+    private void repositionTile(ArrayList list) {
         try {
-            // Check if this is our tile based on position 0 where we injected it
-            if (position != 0) return;
-            
+            Context context = (Context) currentApplication();
+            int wanted = clampIndex(getGlobalInt(context, TILE_INDEX_KEY, 0), list.size() - 1);
+            for (int i = 0; i < list.size(); i++) {
+                if (buttonType(list.get(i)) == NEVER_SLEEP_TILE) {
+                    Object item = list.remove(i);
+                    list.add(wanted, item);
+                    XposedBridge.log(TAG + ": runtime tile positioned=" + wanted);
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static int clampIndex(int index, int size) {
+        return Math.max(0, Math.min(index, Math.max(0, size)));
+    }
+
+    private static int buttonType(Object info) {
+        try { return ((Integer) XposedHelpers.callMethod(info, "f")).intValue(); }
+        catch (Throwable ignored) { return -1; }
+    }
+
+    private void configureButton(Object adapter, Object holder, int position) {
+        try {
+            List<?> data = (List<?>) XposedHelpers.getObjectField(adapter, "a");
+            if (position < 0 || position >= data.size()) return;
+            Object item = data.get(position);
+            if (MAPPED_BIND_ITEM.get() != item && buttonType(item) != NEVER_SLEEP_TILE) return;
+            XposedBridge.log(TAG + ": binding quick tile position=" + position + " type=" + buttonType(item));
+
             final View button = (View) XposedHelpers.getObjectField(holder, "a");
             final Context context = button.getContext();
             
-            button.setOnClickListener(new View.OnClickListener() {
+            View.OnClickListener listener = new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
                     toggleNeverSleep(context);
                     refreshTile(context);
                 }
-            });
-            
+            };
+            button.setOnClickListener(listener);
+            button.setClickable(true);
+            View itemView = (View) XposedHelpers.getObjectField(holder, "itemView");
+            itemView.setOnClickListener(listener);
+            itemView.setClickable(true);
+            button.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    button.setOnClickListener(listener);
+                    itemView.setOnClickListener(listener);
+                }
+            }, 100L);
+
             sButton = button;
+            XposedBridge.log(TAG + ": quick tile configured position=" + position);
             syncProps(context);
             button.post(new Runnable() {
                 @Override
@@ -285,7 +431,7 @@ public final class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    private Drawable getModuleDrawable(Context context) {
+    private static Drawable getModuleDrawable(Context context) {
         try {
             Context moduleContext = context.createPackageContext(MODULE_PACKAGE, Context.CONTEXT_IGNORE_SECURITY);
             int id = moduleContext.getResources().getIdentifier("ic_launcher_foreground", "mipmap", MODULE_PACKAGE);
@@ -327,7 +473,7 @@ public final class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private int getGlobalInt(Context c, String k, int d) {
+    private static int getGlobalInt(Context c, String k, int d) {
         try {
             return (Integer) XposedHelpers.callStaticMethod(
                 XposedHelpers.findClass("android.provider.Settings$Global", null),
@@ -337,7 +483,7 @@ public final class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private void putGlobalInt(Context c, String k, int v) {
+    private static void putGlobalInt(Context c, String k, int v) {
         try {
             XposedHelpers.callStaticMethod(
                 XposedHelpers.findClass("android.provider.Settings$Global", null),

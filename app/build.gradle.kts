@@ -8,6 +8,10 @@ android {
         version = release(37)
     }
 
+    packaging {
+        resources.excludes += "/keystore"
+    }
+
     defaultConfig {
         applicationId = "com.hamer.piconeversleep"
         minSdk = 29
