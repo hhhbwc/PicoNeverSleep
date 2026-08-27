@@ -9,6 +9,7 @@ import android.widget.ImageView;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.UUID;
 import java.util.ArrayList;
 import java.util.List;
 import java.lang.reflect.Constructor;
@@ -31,6 +32,12 @@ public final class MainHook implements IXposedHookLoadPackage {
     private static final String TILE_INDEX_KEY = "pico_neversleep_quick_index";
     private static final String SETTING_NEVER_SLEEP = "pvr_never_sleep_enabled";
     private static final String PROP_NEVER_SLEEP_VOLATILE = "pvr.factorytest.never.sleep";
+    private static final String VSLEEP_ENABLED_KEY = "pico_vsleep_enabled";
+    private static final String COORD_REQUEST = "pico_power_coord_v2_request";
+    private static final String COORD_ACK = "pico_power_coord_v2_ack";
+    private static final String COORD_OWNER = "pico_power_coord_v2_effective_owner";
+    private static final String COORD_PHASE = "pico_power_coord_v2_phase";
+    private static final String VSLEEP_WAS_ENABLED_KEY = "pico_neversleep_vsleep_was_enabled";
     private static final String MODULE_PACKAGE = "com.hamer.piconeversleep";
     
     private static volatile Object sButton;
@@ -103,14 +110,11 @@ public final class MainHook implements IXposedHookLoadPackage {
                 }
             });
 
-            // Hook the list update method to ensure no duplicates
+            // Normalize the input before the adapter publishes it to RecyclerView.
             XposedHelpers.findAndHookMethod(adapterClass, "b", ArrayList.class, new XC_MethodHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam p) {
-                    ArrayList<?> list = (ArrayList<?>) XposedHelpers.getObjectField(p.thisObject, "a");
-                    if (list == null) list = (ArrayList<?>) p.args[0];
-                    removeDuplicates(list);
-                    repositionTile(list);
+                protected void beforeHookedMethod(MethodHookParam p) {
+                    normalizeRuntimeTiles((ArrayList) p.args[0]);
                 }
             });
 
@@ -157,7 +161,7 @@ public final class MainHook implements IXposedHookLoadPackage {
         return Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null);
     }
     private static int panelType(Object item) { try { return ((Integer) item.getClass().getMethod("f").invoke(item)).intValue(); } catch (Throwable t) { return -1; } }
-    private static int panelIndex(Object item) { try { return ((Integer) item.getClass().getMethod("d").invoke(item)).intValue(); } catch (Throwable t) { return 0; } }
+    private static int panelIndex(Object item) { try { return ((Integer) item.getClass().getMethod("d").invoke(item)).intValue(); } catch (Throwable t) { return -1; } }
     private static boolean panelAdded(Object item) { try { return ((Boolean) item.getClass().getMethod("g").invoke(item)).booleanValue(); } catch (Throwable t) { return false; } }
     private static int panelName(Object item) { try { return ((Integer) item.getClass().getMethod("e").invoke(item)).intValue(); } catch (Throwable t) { return 0; } }
     private static int panelIcon(Object item) { try { return ((Integer) item.getClass().getMethod("b").invoke(item)).intValue(); } catch (Throwable t) { return 0; } }
@@ -182,13 +186,23 @@ public final class MainHook implements IXposedHookLoadPackage {
             Object context = currentApplication(); ArrayList copy = new ArrayList(list);
             for (Object item : list) if (panelType(item) == NEVER_SLEEP_TILE) {
                 putGlobalInt((Context) context, TILE_ADDED_KEY, panelAdded(item) ? 1 : 0);
-                int savedIndex = list.indexOf(item);
+                int savedIndex = panelIndex(item);
+                if (savedIndex < 0) savedIndex = list.indexOf(item);
                 putGlobalInt((Context) context, TILE_INDEX_KEY, savedIndex);
                 XposedBridge.log(TAG + ": saved editable tile state added=" + (panelAdded(item) ? 1 : 0) + " index=" + savedIndex + " itemIndex=" + panelIndex(item));
                 copy.remove(item);
             }
             return copy;
-        } catch (Throwable t) { return list; }
+        } catch (Throwable t) {
+            ArrayList filtered = new ArrayList();
+            if (list != null) {
+                for (Object item : list) {
+                    if (panelType(item) != NEVER_SLEEP_TILE) filtered.add(item);
+                }
+            }
+            XposedBridge.log(TAG + ": editable tile save failed; filtered virtual tile: " + t);
+            return filtered;
+        }
     }
     private static void bindEditorTile(Object adapter, Object holder, int position) {
         try {
@@ -280,31 +294,31 @@ public final class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
-    private void removeDuplicates(ArrayList<?> list) {
-        boolean seen = false;
-        for (int i = list.size() - 1; i >= 0; i--) {
-            try {
-                if (buttonType(list.get(i)) == NEVER_SLEEP_TILE) {
-                    if (seen) list.remove(i);
-                    else seen = true;
-                }
-            } catch (Throwable ignored) {}
-        }
-    }
-
-    private void repositionTile(ArrayList list) {
+    private void normalizeRuntimeTiles(ArrayList list) {
+        if (list == null) return;
         try {
-            Context context = (Context) currentApplication();
-            int wanted = clampIndex(getGlobalInt(context, TILE_INDEX_KEY, 0), list.size() - 1);
-            for (int i = 0; i < list.size(); i++) {
+            Object tile = null;
+            for (int i = list.size() - 1; i >= 0; i--) {
                 if (buttonType(list.get(i)) == NEVER_SLEEP_TILE) {
-                    Object item = list.remove(i);
-                    list.add(wanted, item);
-                    XposedBridge.log(TAG + ": runtime tile positioned=" + wanted);
-                    return;
+                    if (tile == null) tile = list.get(i);
+                    else list.remove(i);
                 }
             }
-        } catch (Throwable ignored) {}
+            if (tile == null) return;
+            Context context = (Context) currentApplication();
+            int current = list.indexOf(tile);
+            int wanted = TilePositionPolicy.normalizedIndex(
+                    current,
+                    getGlobalInt(context, TILE_INDEX_KEY, 0),
+                    list.size());
+            if (current != wanted) {
+                list.remove(tile);
+                list.add(wanted, tile);
+            }
+            XposedBridge.log(TAG + ": runtime tile normalized=" + list.indexOf(tile));
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": runtime tile normalization failed: " + t);
+        }
     }
 
     private static int clampIndex(int index, int size) {
@@ -339,14 +353,6 @@ public final class MainHook implements IXposedHookLoadPackage {
             View itemView = (View) XposedHelpers.getObjectField(holder, "itemView");
             itemView.setOnClickListener(listener);
             itemView.setClickable(true);
-            button.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    button.setOnClickListener(listener);
-                    itemView.setOnClickListener(listener);
-                }
-            }, 100L);
-
             sButton = button;
             XposedBridge.log(TAG + ": quick tile configured position=" + position);
             syncProps(context);
@@ -363,10 +369,32 @@ public final class MainHook implements IXposedHookLoadPackage {
 
     private void toggleNeverSleep(Context context) {
         boolean enabled = isNeverSleepEnabled(context);
-        String val = enabled ? "0" : "1";
-        putGlobalInt(context, SETTING_NEVER_SLEEP, enabled ? 0 : 1);
-        setProp(PROP_NEVER_SLEEP_VOLATILE, val);
-        XposedBridge.log(TAG + ": Never Sleep toggled to " + (!enabled));
+        if (!enabled) {
+            boolean vsleepActive = getGlobalInt(context, VSLEEP_ENABLED_KEY, 0) == 1
+                    && "vsleep".equals(getGlobalString(context, COORD_OWNER))
+                    && "active".equals(getGlobalString(context, COORD_PHASE));
+            putGlobalInt(context, VSLEEP_WAS_ENABLED_KEY, vsleepActive ? 1 : 0);
+            requestPowerOwner(context, "enable");
+            putGlobalInt(context, SETTING_NEVER_SLEEP, 1);
+            setProp(PROP_NEVER_SLEEP_VOLATILE, "1");
+            XposedBridge.log(TAG + ": Never Sleep enabled; previous V-Sleep=" + vsleepActive);
+        } else {
+            putGlobalInt(context, SETTING_NEVER_SLEEP, 0);
+            setProp(PROP_NEVER_SLEEP_VOLATILE, "0");
+            requestPowerOwner(context, "disable");
+            XposedBridge.log(TAG + ": Never Sleep disabled; released power owner");
+        }
+    }
+
+    private void requestPowerOwner(Context context, String payload) {
+        String request = "2|" + UUID.randomUUID().toString() + "|power|" + payload;
+        putGlobalString(context, COORD_REQUEST, request);
+        long deadline = System.currentTimeMillis() + 1500L;
+        while (System.currentTimeMillis() < deadline) {
+            if (request.equals(getGlobalString(context, COORD_ACK))) return;
+            try { Thread.sleep(50L); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+        }
+        XposedBridge.log(TAG + ": power request not acknowledged immediately: " + payload);
     }
 
     private void syncProps(Context context) {
@@ -490,6 +518,24 @@ public final class MainHook implements IXposedHookLoadPackage {
                 "putInt", c.getContentResolver(), k, v);
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": setting write failed " + k + ": " + t);
+        }
+    }
+
+    private static String getGlobalString(Context c, String k) {
+        try {
+            return (String) XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("android.provider.Settings$Global", null),
+                    "getString", c.getContentResolver(), k);
+        } catch (Throwable t) { return null; }
+    }
+
+    private static void putGlobalString(Context c, String k, String v) {
+        try {
+            XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("android.provider.Settings$Global", null),
+                    "putString", c.getContentResolver(), k, v);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": string write failed " + k + ": " + t);
         }
     }
 }

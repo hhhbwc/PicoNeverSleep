@@ -11,7 +11,11 @@ import static org.junit.Assert.*;
  */
 public class ExampleUnitTest {
     @Test
-    public void addition_isCorrect() {
-        assertEquals(4, 2 + 2);
+    public void tilePositionIsClampedAndStable() {
+        assertEquals(5, TilePositionPolicy.normalizedIndex(1, 5, 7));
+        assertEquals(5, TilePositionPolicy.normalizedIndex(5, 5, 7));
+        assertEquals(6, TilePositionPolicy.normalizedIndex(2, 99, 7));
+        assertEquals(0, TilePositionPolicy.normalizedIndex(4, -3, 7));
+        assertEquals(0, TilePositionPolicy.normalizedIndex(0, 4, 0));
     }
 }
