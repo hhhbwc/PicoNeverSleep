@@ -288,7 +288,8 @@ public final class MainHook implements IXposedHookLoadPackage {
     private boolean hasTile(List<?> list, int type) {
         try {
             for (Object item : list) {
-                if ((Integer) XposedHelpers.callMethod(item, "f") == type) return true;
+                int t = ((Integer) XposedHelpers.callMethod(item, "f")).intValue();
+                if (t == type) return true;
             }
         } catch (Throwable ignored) {}
         return false;
